@@ -1,14 +1,15 @@
+#include <stdexcept>
 #include <cstdint>
 #include <vector>
 #include <utility>
 #include <iostream>
 #include <string>
 #include <fstream>
+#include <algorithm>
+#include <iterator>
 
-using namespace std;
-
-typedef unsigned char byte;
-typedef vector<byte> bytes;
+using byte = std::uint8_t;
+using bytes = std::vector<byte>;
 
 /// Generate the keystream
 ///
@@ -31,123 +32,136 @@ typedef vector<byte> bytes;
 /// * I am pretty sure that the keystream leaks more
 ///   information about the key, but I haven't found out how
 ///   yet
-vector<byte> generate_keystream(bytes key /* copy */, size_t len) {
-  vector<byte> out(len);
 
-  byte q = 0;
-  for (size_t ix = 0; ix < len; ix++) {
+class keystream_generator {
+public:
+	static constexpr std::size_t keysize = 256;
 
-    // variable meanings unknown
+	keystream_generator(bytes key) : m_key{std::move(key)} {
+		if (m_key.size() != keysize) {
+			throw std::invalid_argument{"invalid keysize(" + std::to_string(key.size()) + ")"};
+		}
+	}
 
-    // Values: 1, 2, 3, ..., 255, 1, ...Q
-    byte h = (ix + 1) % 256;
-    // Values: key[1], key[1] + key[2], ...
-    // as subject to the swapping below
-    q = (q + key[h]) % 256;
+	byte operator()() {
+		// variable meanings unknown
 
-    swap(key[h], key[q]);
+		// Values: 1, 2, 3, ..., 255, 1, ...Q
+		byte h = static_cast<byte>((++m_i) % keysize);
+		// Values: key[1], key[1] + key[2], ...
+		// as subject to the swapping below
+		m_q = (m_q + m_key[h]) % keysize;
+		std::swap(m_key[h], m_key[m_q]);
+		byte w = (m_key[h] + m_key[m_q]) % keysize;
+		return m_key[w];
+	}
 
-    byte w = (key[h] + key[q]) % 256;
+	const bytes& key() const { return m_key; }
+	std::size_t pos() const { return m_i; }
 
-    out[ix] = key[ w ];
-  }
+private:
+	bytes m_key;
+	std::size_t m_i = 0;
+	byte m_q = 0;
+};
 
-  return out;
+class keystream_iterator : std::iterator<std::input_iterator_tag, const byte> {
+public:
+	keystream_iterator(bytes key) : m_gen{std::move(key)} {
+		++(*this);
+	}
+
+	reference operator*() const { return m_current; }
+	pointer operator->() const { return &m_current; }
+	keystream_iterator& operator++() {
+		m_current = m_gen();
+		return *this;
+	}
+	struct byte_wrapper {
+		byte value;
+		byte operator*() const { return value; }
+	};
+	byte_wrapper operator++(int) {
+		byte_wrapper retval{m_current};
+		m_current = m_gen();
+		return retval;
+	}
+	friend bool operator==(const keystream_iterator& l, const keystream_iterator& r) {
+		return l.m_gen.key() == r.m_gen.key() and l.m_gen.pos() == r.m_gen.pos();
+	}
+	friend bool operator!=(const keystream_iterator& l, const keystream_iterator& r) {
+		return !(l == r);
+	}
+
+private:
+	keystream_generator m_gen;
+	byte m_current;
+};
+
+
+bytes read_key(const std::string& filename) {
+	constexpr auto keysize = keystream_generator::keysize;
+	std::ifstream file{filename};
+	if (!file.is_open()) {
+		throw std::runtime_error{"could not open key-file"};
+	}
+	file >> std::noskipws;
+	bytes key;
+	key.reserve(keysize);
+	std::copy_n(std::istream_iterator<byte>{file}, keysize, std::back_inserter(key));
+	return key;
 }
 
-/// XOR two entire vectors of bytes
-bytes& operator^=(bytes &a, const bytes &b) {
-  for (size_t ix = 0; ix < a.size(); ix++)
-    a[ix] ^= b[ix];
-  return a;
-}
 
-/// encrypt & decrypt;
-///
-/// This simply generates the static keystream and XORs the
-/// input with the keystream.
-/// This both encrypts and decrypts because double-xor
-/// results in the input `A = xor(xor(A, K), K)`
-///
-/// No padding to conceal size, no salting because the
-/// original algorithm didn't do so either.
-vector<byte> crypt(const bytes &key, const bytes &text) {
-bytes ks = generate_keystream(key, text.size());
-ks ^= text;
-return ks;
-}
-
-template<typename Str>
-bytes read_stream(Str &s) {
-bytes buf(2048);
-size_t used = 0;
-
-while (true) {
-  size_t do_read = buf.size() - used;
-  s.read((char*)&buf[0], do_read);
-  used += s.gcount();
-
-  if (s.eof())
-    break;
-  else if ((size_t)s.gcount() < do_read)
-    continue;
-  else {
-    buf.resize( buf.size() * 2);
-  }
-}
-
-buf.resize(used);
-return buf;
-}
-
-bytes read_file(const string &name) {
-  fstream str(name, ios::binary | ios::in);
-  return read_stream(str);
+int usage(int retval) {
+	std::cerr << "USAGE: "
+	          << "\n  (1) terrible crypt keyfile <plaintext >cyphertext"
+	          << "\n  (2) terrible keystream keyfile length > keystream_file"
+	          << "\n  (3) terrible xor file_a file_b > result\n";
+	return retval;
 }
 
 
-template<typename Str>
-void write_stream(Str &s, const bytes &buf) {
-  s.write((char*)&buf[0], buf.size());
-}
+int main(int argc, char** argv) try {
+	if (argc < 2) {
+		return usage(1);
+	}
+	std::string command = argv[1];
+	std::cin >> std::noskipws;
+	std::ostream_iterator<byte> out{std::cout};
 
-void usage() {
-  cerr << "USAGE: "
-    << "\n  (1) terrible crypt keyfile <plaintext >cyphertext"
-    << "\n  (2) terrible keystream keyfile length > keystream_file"
-    << "\n  (3) terrible xor file_a file_b > result\n";
-  exit(1);
-}
-
-int main(int argc, char **argv) {
-  if (argc < 2) usage();
-  string command = argv[1];
-
-
-  if (command == "crypt") {
-    if (argc < 3) usage();
-    bytes key = read_file(argv[2]);
-    bytes text = read_stream(cin);
-
-    write_stream(cout, crypt(key, text));
-
-  } else if (command == "keystream") {
-    if (argc < 4) usage();
-    bytes key = read_file(argv[2]);
-    auto len = atoll(argv[3]);
-
-    write_stream(cout, generate_keystream(key, len));
-
-  } else if (command == "xor") {
-    if (argc < 4) usage();
-    bytes buf = read_file(argv[2]);
-    buf ^= read_file(argv[3]);
-
-    write_stream(cout, buf);
-
-  } else {
-    usage();
-  }
-
-  return 0;
+	if (command == "crypt") {
+		std::istream_iterator<byte> in_it{std::cin};
+		if (argc < 3) {
+			return usage(1);
+		}
+		bytes key = read_key(argv[2]);
+		std::transform(in_it, {}, keystream_iterator{key}, out, std::bit_xor<byte>{});
+	} else if (command == "keystream") {
+		if (argc < 4)
+			return usage(1);
+		bytes key = read_key(argv[2]);
+		auto len = std::stoul(argv[3]);
+		std::generate_n(out, len, keystream_generator{key});
+	} else if (command == "xor") {
+		if (argc < 4) {
+			return usage(1);
+		}
+		std::fstream file_1{argv[2]};
+		std::fstream file_2{argv[3]};
+		if (!file_1.is_open() or !file_2.is_open()) {
+			std::cerr << "Error: could not open file!\n";
+			return 2;
+		}
+		file_1 >> std::noskipws;
+		file_2 >> std::noskipws;
+		using byte_it = std::istream_iterator<byte>;
+		std::transform(byte_it{file_1}, {}, byte_it{file_2}, out, std::bit_xor<byte>{});
+	} else {
+		return usage(1);
+	}
+	return 0;
+} catch(std::exception& e) {
+	std::cerr << "Error: " << e.what() << '\n';
+	return 3;
 }

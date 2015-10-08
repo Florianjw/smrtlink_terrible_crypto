@@ -27,6 +27,7 @@ Compiler will be used as linker driver.
 # LICENSE
 
 Copyright © 2015 Karolin Varner
+Copyright © 2015 Florian Weber
 
 Released under zlib; buy me a drink if you like it.
 
